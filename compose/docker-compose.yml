@@ -1,0 +1,165 @@
+name: sarnaut
+
+services:
+  postgres:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: sarnaut
+      POSTGRES_USER: sarnaut
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sarnaut_dev}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sarnaut -d sarnaut"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - sarnaut
+
+  valkey:
+    image: valkey/valkey:latest
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - valkey_data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks:
+      - sarnaut
+
+  nats:
+    image: nats:alpine
+    restart: unless-stopped
+    command: ["--jetstream", "--store_dir", "/data", "--http_port", "8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - nats_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks:
+      - sarnaut
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-sarnaut}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-sarnaut}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-sarnaut_dev}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          clickhouse-client --user "$${CLICKHOUSE_USER}"
+          --password "$${CLICKHOUSE_PASSWORD}" --query "SELECT 1"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    networks:
+      - sarnaut
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/sarnaut/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus:/etc/prometheus/sarnaut:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - otel-collector
+    networks:
+      - sarnaut
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_PLUGINS_PREINSTALL: grafana-clickhouse-datasource
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-sarnaut}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-sarnaut}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-sarnaut_dev}
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./observability/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      loki:
+        condition: service_started
+      prometheus:
+        condition: service_started
+    networks:
+      - sarnaut
+
+  loki:
+    image: grafana/loki:latest
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/sarnaut/loki.yml"]
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./observability/loki:/etc/loki/sarnaut:ro
+      - loki_data:/loki
+    networks:
+      - sarnaut
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol-contrib/sarnaut/config.yml"]
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    volumes:
+      - ./observability/otel-collector:/etc/otelcol-contrib/sarnaut:ro
+    depends_on:
+      - loki
+    networks:
+      - sarnaut
+
+volumes:
+  postgres_data:
+  valkey_data:
+  nats_data:
+  clickhouse_data:
+  clickhouse_logs:
+  prometheus_data:
+  grafana_data:
+  loki_data:
+
+networks:
+  sarnaut:
+    name: sarnaut
+    driver: bridge
